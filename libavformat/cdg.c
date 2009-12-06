@@ -52,10 +52,10 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     ByteIOContext *pb = s->pb;
 
     ret = av_get_packet(pb, pkt, CDG_PACKET_SIZE);
-    if (pb->eof_reached == 1)
-	return -1;
     if (ret < 0)
 	return ret;
+    if (ret != CDG_PACKET_SIZE)
+	return AVERROR(EPIPE);
 
     pkt->stream_index = 0;
     return 0;

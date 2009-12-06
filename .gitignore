@@ -10,6 +10,8 @@
 *.ogg
 *.au
 *.mpg
+*.mp3
+*.msg
 *.m3u
 *.log
 *.diff
