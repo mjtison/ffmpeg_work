@@ -27,9 +27,7 @@
 
 static int read_header(AVFormatContext *s, AVFormatParameters *ap)
 {
-    int64_t result;
     AVStream *vst;
-    ByteIOContext *pb = s->pb;
 
     vst = av_new_stream(s, 0);
     if (!vst)
@@ -41,24 +39,21 @@ static int read_header(AVFormatContext *s, AVFormatParameters *ap)
     /// 75 sectors/sec * 4 packets/sector = 300 packets/sec
     av_set_pts_info(vst, 32, 1, 300);
 
-    result = url_fsize(pb);
-    vst->duration = (result * vst->time_base.den) / (CDG_PACKET_SIZE * 300);
+    vst->duration = (url_fsize(s->pb) * vst->time_base.den) / (CDG_PACKET_SIZE * 300);
     return 0;
 }
 
 static int read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     int ret;
-    ByteIOContext *pb = s->pb;
 
-    ret = av_get_packet(pb, pkt, CDG_PACKET_SIZE);
-    if (ret < 0)
-	return ret;
-    if (ret != CDG_PACKET_SIZE)
-	return AVERROR(EPIPE);
-
+    ret = av_get_packet(s->pb, pkt, CDG_PACKET_SIZE);
+    if (ret >= 0 && ret < CDG_PACKET_SIZE) {
+	av_free_packet(pkt);
+	ret = AVERROR(EIO);
+    }
     pkt->stream_index = 0;
-    return 0;
+    return ret;
 }
 
 AVInputFormat cdg_demuxer = {
