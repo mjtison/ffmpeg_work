@@ -38,8 +38,6 @@
 #define CDG_BORDER_WIDTH           6
 #define CDG_BORDER_HEIGHT         12
 
-#define CDG_PALETTE_SIZE          16
-
 /// masks
 #define CDG_COMMAND             0x09
 #define CDG_MASK                0x3F
@@ -59,6 +57,10 @@
 #define CDG_DATA_SIZE             16
 #define CDG_TILE_HEIGHT           12
 #define CDG_TILE_WIDTH             6
+#define CDG_MINIMUM_PKT_SIZE       6
+#define CDG_MINIMUM_SCROLL_SIZE    3
+#define CDG_HEADER_SIZE            8
+#define CDG_PALETTE_SIZE          16
 
 typedef struct CDGraphicsContext {
     AVFrame frame;
@@ -120,12 +122,9 @@ static void cdg_load_palette(CDGraphicsContext *cc, uint8_t *data, int low)
 
     for (i = 0; i < 8; i++) {
         color = (data[2 * i] << 6) + (data[2 * i + 1] & 0x3F);
-        r = (color >> 8) & 0x000F;
-        g = (color >> 4) & 0x000F;
-        b = (color     ) & 0x000F;
-        r *= 17;
-        g *= 17;
-        b *= 17;
+        r = ((color >> 8) & 0x000F) * 17;
+        g = ((color >> 4) & 0x000F) * 17;
+        b = ((color     ) & 0x000F) * 17;
         palette[i + array_offset] = r << 16 | g << 8 | b;
     }
     cc->frame.palette_has_changed = 1;
@@ -133,7 +132,7 @@ static void cdg_load_palette(CDGraphicsContext *cc, uint8_t *data, int low)
 
 static int cdg_tile_block(CDGraphicsContext *cc, uint8_t *data, int b)
 {
-    int ci, ri;
+    unsigned ci, ri;
     int color;
     int x, y;
     int ai;
@@ -143,14 +142,10 @@ static int cdg_tile_block(CDGraphicsContext *cc, uint8_t *data, int b)
     ri = (data[2] & 0x1F) * CDG_TILE_HEIGHT + cc->vscroll;
     ci = (data[3] & 0x3F) * CDG_TILE_WIDTH  + cc->hscroll;
 
-    if ((unsigned) ri > (CDG_FULL_HEIGHT - CDG_TILE_HEIGHT)) {
-        av_log(NULL, AV_LOG_ERROR, "tile is out of height range\n");
+    if (ri > (CDG_FULL_HEIGHT - CDG_TILE_HEIGHT))
         return AVERROR(EINVAL);
-    }
-    if ((unsigned) ci > (CDG_FULL_WIDTH - CDG_TILE_WIDTH)) {
-        av_log(NULL, AV_LOG_ERROR, "tile is out a width range\n");
+    if (ci > (CDG_FULL_WIDTH - CDG_TILE_WIDTH))
         return AVERROR(EINVAL);
-    }
 
     for (y = 0; y < CDG_TILE_HEIGHT; y++) {
         for (x = 0; x < CDG_TILE_WIDTH; x++) {
@@ -180,8 +175,8 @@ static void cdg_copy_rect_buf(int out_tl_x, int out_tl_y, uint8_t *out,
 {
     int y;
 
-    in  = in  + in_tl_x  + in_tl_y  * stride;
-    out = out + out_tl_x + out_tl_y * stride;
+    in  += in_tl_x  + in_tl_y  * stride;
+    out += out_tl_x + out_tl_y * stride;
     for (y = 0; y < h; y++)
         memcpy(out + y * stride, in + y * stride, w);
 }
@@ -199,11 +194,12 @@ static void cdg_fill_wrapper(int out_tl_x, int out_tl_y, uint8_t *out,
                              int in_tl_x, int in_tl_y, uint8_t *in,
                              int color, int w, int h, int stride, int roll)
 {
-    if (roll)
+    if (roll) {
         cdg_copy_rect_buf(out_tl_x, out_tl_y, out, in_tl_x, in_tl_y,
                           in, w, h, stride);
-    else
+    } else {
         cdg_fill_rect_preset(out_tl_x, out_tl_y, out, color, w, h, stride);
+    }
 }
 
 static void cdg_scroll(CDGraphicsContext *cc, uint8_t *data,
@@ -275,47 +271,68 @@ static int cdg_decode_frame(AVCodecContext *avctx,
 {
     const uint8_t *buf = avpkt->data;
     int buf_size       = avpkt->size;
-    int ret, xor, cpy;
+    int ret;
     uint8_t command, inst;
     uint8_t cdg_data[CDG_DATA_SIZE];
     AVFrame new_frame;
     CDGraphicsContext *cc = avctx->priv_data;
 
-    if (avctx->reget_buffer(avctx, &cc->frame)) {
+    if (buf_size < CDG_MINIMUM_PKT_SIZE) {
+        av_log(avctx, AV_LOG_ERROR, "buffer too small for decoder\n");
+        return AVERROR(EINVAL);
+    }
+
+    ret = avctx->reget_buffer(avctx, &cc->frame);
+    if (ret) {
         av_log(avctx, AV_LOG_ERROR, "reget_buffer() failed\n");
-        return -1;
+        return ret;
     }
 
     command = bytestream_get_byte(&buf);
     inst    = bytestream_get_byte(&buf);
+    inst    &= CDG_MASK;
     buf += 2;  /// skipping 2 unneeded bytes
-    bytestream_get_buffer(&buf, cdg_data, CDG_DATA_SIZE);
+    bytestream_get_buffer(&buf, cdg_data, buf_size - CDG_HEADER_SIZE);
 
     if ((command & CDG_MASK) == CDG_COMMAND) {
-        switch (inst & CDG_MASK) {
+        switch (inst) {
         case CDG_INST_MEMORY_PRESET:
             if (!(cdg_data[1] & 0x0F))
                 memset(cc->frame.data[0], cdg_data[0] & 0x0F,
                        cc->frame.linesize[0] * CDG_FULL_HEIGHT);
             break;
         case CDG_INST_LOAD_PAL_LO:
-            cdg_load_palette(cc, cdg_data, 1);
-            break;
         case CDG_INST_LOAD_PAL_HIGH:
-            cdg_load_palette(cc, cdg_data, 0);
+            if (buf_size - CDG_HEADER_SIZE < CDG_DATA_SIZE) {
+                av_log(avctx, AV_LOG_ERROR, "buffer too small for loading palette\n");
+                return AVERROR(EINVAL);
+            }
+
+            cdg_load_palette(cc, cdg_data, inst == CDG_INST_LOAD_PAL_LO);
             break;
         case CDG_INST_BORDER_PRESET:
             cdg_border_preset(cc, cdg_data);
             break;
         case CDG_INST_TILE_BLOCK_XOR:
         case CDG_INST_TILE_BLOCK:
-            xor = (inst & CDG_MASK) == CDG_INST_TILE_BLOCK_XOR ? 1 : 0;
-            ret = cdg_tile_block(cc, cdg_data, xor);
-            if (ret)
+            if (buf_size - CDG_HEADER_SIZE < CDG_DATA_SIZE) {
+                av_log(avctx, AV_LOG_ERROR, "buffer too small for drawing tile\n");
+                return AVERROR(EINVAL);
+            }
+
+            ret = cdg_tile_block(cc, cdg_data, inst == CDG_INST_TILE_BLOCK_XOR);
+            if (ret) {
+                av_log(avctx, AV_LOG_ERROR, "tile is out of range\n");
                 return ret;
+            }
             break;
         case CDG_INST_SCROLL_PRESET:
         case CDG_INST_SCROLL_COPY:
+            if (buf_size - CDG_HEADER_SIZE < CDG_MINIMUM_SCROLL_SIZE) {
+                av_log(avctx, AV_LOG_ERROR, "buffer too small for scrolling\n");
+                return AVERROR(EINVAL);
+            }
+
             cdg_init_frame(&new_frame);
             ret = avctx->get_buffer(avctx, &new_frame);
             if (ret) {
@@ -323,8 +340,7 @@ static int cdg_decode_frame(AVCodecContext *avctx,
                 return ret;
             }
 
-            cpy = (inst & CDG_MASK) == CDG_INST_SCROLL_COPY ? 1 : 0;
-            cdg_scroll(cc, cdg_data, &new_frame, cpy);
+            cdg_scroll(cc, cdg_data, &new_frame, inst == CDG_INST_SCROLL_COPY);
             avctx->release_buffer(avctx, &cc->frame);
             cc->frame = new_frame;
             break;
